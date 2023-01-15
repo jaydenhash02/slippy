@@ -1,0 +1,438 @@
+#!/usr/bin/env python3
+PATH="$PATH:."
+import sys, re
+
+def regex_addr(addr):
+    return re.search(r'/.*/', addr)
+
+def dollar_addr(addr):
+    return re.search(r'\$', addr)
+    
+def sed_search(command):
+    return re.search(r'^s(.).*\1.*\1(g|)$', command) \
+    or re.search(r'^([1-9]+0*|/.*/|\$)?(s/.*/.*/(g|))$', command) \
+    or re.search(r'^([1-9]+0*|/.*/|\$),([1-9]+0*|/.*/|\$)(s/.*/.*/(g|))$', command)
+                
+def s_index_sed_search(command):
+    try:
+        s_index = command.index('s')
+    except ValueError:
+        s_index = 0
+    return s_index
+    
+def sed_quit(command):
+    return re.search(r'^([1-9]+0*|/.*/|\$)?q$', command)
+    
+def sed_label(command):
+    return re.search(r'^: *[^ ;\n]+', command)
+    
+def sed_branch(command):
+    return re.search(r'^([1-9]+0*|/.*/|\$)?b *[^ ;\n]+', command) \
+    or re.search(r'^([1-9]+0*|/.*/|\$),([1-9]+0*|/.*/|\$)b *[^ ;\n]+', command)
+    
+def sed_conditional_branch(command):
+    return re.search(r'^([1-9]+0*|/.*/|\$)?t *[^ ;\n]+', command) \
+    or re.search(r'^([1-9]+0*|/.*/|\$),([1-9]+0*|/.*/|\$)t *[^ ;\n]+', command)
+    
+def sed_print(command):
+    return re.search(r'^([1-9]+0*|/.*/|\$)?p$', command) \
+    or re.search(r'^([1-9]+0*|/.*/|\$),([1-9]+0*|/.*/|\$)p$', command)
+    
+def sed_delete(command):
+    return re.search(r'^([1-9]+0*|/.*/|\$)?d$', command) \
+    or re.search(r'^([1-9]+0*|/.*/|\$),([1-9]+0*|/.*/|\$)d$', command)
+    
+def sed_append(command):   
+    return re.search(r'^(([1-9]+0*|/.*/|\$)?a)', command) \
+    or re.search(r'^(([1-9]+0*|/.*/|\$),([1-9]+0*|/.*/|\$)a)', command)
+    
+def sed_insert(command):   
+    return re.search(r'^(([1-9]+0*|/.*/|\$)?i)', command) \
+    or re.search(r'^(([1-9]+0*|/.*/|\$),([1-9]+0*|/.*/|\$)i)', command)
+    
+def sed_change(command):   
+    return re.search(r'^(([1-9]+0*|/.*/|\$)?c)', command) \
+    or re.search(r'^(([1-9]+0*|/.*/|\$),([1-9]+0*|/.*/|\$)c)', command)
+    
+dash_n_flag = False
+dash_f_flag = False
+dash_i_flag = False
+found_input_commands = False
+input_file_flag = False
+list_input = []
+# process command line arguments
+for i, arg in enumerate(sys.argv[1:]):
+    if arg.startswith('-'):
+        if arg == '-n':
+            dash_n_flag = True
+        elif arg == '-f':
+            dash_f_flag = True
+        elif arg == '-i':
+            dash_i_flag = True
+        else:
+            print("usage: slippy [-i] [-n] [-f <script-file> | <sed-command>] [<files>...]", file=sys.stderr)
+            sys.exit(1)
+    elif not found_input_commands:
+        if dash_f_flag:
+            try:
+                with open(sys.argv[i + 1]) as infile:
+                    all_commands = infile.read()
+            except: 
+                print("slippy: error", file=sys.stderr)
+                sys.exit(1)
+        else:
+            all_commands = arg
+        found_input_commands = True
+    else: 
+        list_input.append(arg)
+
+formatted_split_commands = []
+for command in re.split(r'(;)|(\n)|( )', all_commands):
+    if not command: continue
+    formatted_split_commands.append(command)
+
+append_command = ""
+finished_append = False
+
+# store commands in a list, because we can allow duplicates
+store_commands = []
+
+# store any labels, maps name_of_label:index within all commands
+store_labels = {} 
+
+sc_index = 0
+while sc_index < len(formatted_split_commands):
+    # don't put the command separators 
+    if append_command == "" and (formatted_split_commands[sc_index] == ';' 
+    or formatted_split_commands[sc_index] == '\n'):
+        sc_index += 1 
+        continue
+    
+    append_command += formatted_split_commands[sc_index]
+    
+    if re.search(r'^#.*\n$', append_command):
+        append_command = ""
+    # if append, insert or change, add rest of line until newline
+    if re.search(r'^ *(a.*|i.*|c.*) *', append_command) \
+    or re.search(r'^ *([1-9]+0*|/.*/|\$)(a.*|i.*|c.*) *', append_command) \
+    or re.search(r'^ *([1-9]+0*|/.*/|\$) *, *([1-9]+0*|/.*/|\$) *(a.*|i.*|c.*) *', append_command):
+        sc_index += 1
+        while sc_index < len(formatted_split_commands):
+            if formatted_split_commands[sc_index] == '\n':
+                break  
+            append_command += formatted_split_commands[sc_index]
+            sc_index += 1
+            
+        store_commands.append([append_command, [None, None, None], [None, None]])
+        
+        # reset the string
+        append_command = ""
+        
+    # if the current put-together string matches any other valid sed expression
+    elif re.search(r'^ *(s(.).*\2.*\2(g|)|q|p|d|: *[^ ;\n]+|b *[^ ;\n]+|t *[^ ;\n]+) *', append_command) \
+    or re.search(r'^ *([1-9]+0*|/.*/|\$) *(s/.*/.*/(g|)|q|p|d|: *[^ ;\n]+|b *[^ ;\n]+|t *[^ ;\n]+) *', append_command) \
+    or re.search(r'^ *([1-9]+0*|/.*/|\$) *, *([1-9]+0*|/.*/|\$) *(s/.*/.*/(g|)|q|p|d|: *[^ ;\n]+|b *[^ ;\n]+|t *[^ ;\n]+) *', append_command):
+        if sed_search(append_command) or \
+            re.search(r'(: [^ ;\n]+|b [^ ;\n]+|t [^ ;\n]+)', append_command):
+            append_command = append_command.strip()
+            
+            # if command is a label
+            # store it in something to track all the labels
+            if sed_label(append_command):
+                label_name = re.split(r': ', append_command)[1]
+                store_labels[label_name] = len(store_commands)
+        else:
+            append_command = re.sub(r'\b(.*)#.*\n\b', r'\1', append_command)
+            append_command = re.sub(r' +', '', append_command)
+        
+        store_commands.append([append_command, [None, None, None], [None, None]])
+        
+        # reset the string
+        append_command = ""
+        
+    sc_index += 1
+    
+# process our commands, check if any are invalid
+for command in store_commands:
+    c = command[0]
+    if not sed_quit(c) \
+    and not sed_print(c) \
+    and not sed_delete(c) \
+    and not sed_search(c) \
+    and not sed_label(c) \
+    and not sed_branch(c) \
+    and not sed_conditional_branch(c) \
+    and not sed_append(c) \
+    and not sed_insert(c) \
+    and not sed_change(c):
+        print("slippy: command line: invalid command", file=sys.stderr)
+        sys.exit(1)
+
+# tracks the line number of our input
+line_num = 0
+
+
+def main_script(input_stream, output_stream=sys.stdout):
+    global line_num
+    line = None 
+    next_line = input_stream.readline()
+    
+    
+    while True:
+        line = next_line
+        next_line = input_stream.readline()
+        if line == '': return
+        
+        line_num += 1 
+        delete_flag = False
+        quit_flag = False
+        append_list = []
+        insert_list = []
+        change_flag = False
+        successful_search = False
+        
+        i = 0
+        # go through the commands
+        while i < len(store_commands):
+            command = store_commands[i][0]
+        
+            # flag to check if in a between address, the starting address was just found
+            just_found = False
+            
+            # check address for s flag
+            s_index = s_index_sed_search(command)
+                
+            delim = None
+            # if the type of command is s///
+            if sed_search(command):
+                # after s is the delimiter
+                delim = command[s_index + 1]
+                
+            start_addr = None
+            end_addr = None
+            
+            # find starting and ending addresses
+            if command in ['q', 'p', 'd'] or command[0] in ['s', 'a', 'i', 'c', 'b', 't']:
+                store_commands[i][1] = [start_addr, line_num, None]
+            else:
+                # split by the command
+                address_split = re.split(rf's{delim}|q$|p$|d$|a|i|c|b|t', command)
+                if address_split[0]:
+                    address_split = re.split(r',', address_split[0])
+                    start_addr = address_split[0]                    
+                    store_commands[i][1][0] = start_addr
+                    if len(address_split) == 2:
+                        end_addr = address_split[1] 
+                        store_commands[i][2][0] = end_addr
+                        # if we passed this ending address
+                        if end_addr.isnumeric() and line_num > int(end_addr):
+                            end_addr = None
+                            store_commands[i][2][1] = None
+                            
+                # check for match for start_address
+                if start_addr:
+                    if regex_addr(start_addr):
+                        # strip the slashes
+                        start_addr_reg = start_addr[1:-1] 
+                        if re.search(rf'{start_addr_reg}', line):
+                            if not store_commands[i][1][1]:
+                                just_found = True
+                                
+                            store_commands[i][1][1] = line_num
+                            
+                            if just_found and end_addr:
+                                store_commands[i][1][2] = line_num
+                    # the starting address is a line number
+                    elif start_addr.isnumeric(): 
+                        if line_num == int(start_addr):  
+                            if not store_commands[i][1][1]:
+                                just_found = True
+
+                            store_commands[i][1][1] = line_num
+                            
+                            if just_found and end_addr:
+                                store_commands[i][1][2] = line_num
+                    # dollar addr
+                    elif dollar_addr(start_addr):
+                        if next_line == '':
+                            if not store_commands[i][1][1]:
+                                just_found = True
+                                
+                            store_commands[i][1][1] = line_num
+                            
+                            if just_found and end_addr:
+                                store_commands[i][1][2] = line_num
+            
+            # here are our starting address, ending address if we have one
+            if end_addr:
+                start_line = store_commands[i][1][2]
+            else:
+                start_line = store_commands[i][1][1]
+            end_line = store_commands[i][2][1]
+
+            # if we pass the ending line and found a new match, the ending line is set to 0 and 
+            # we research the line for a new match
+            if start_line and end_line:
+                if start_line > end_line:
+                    end_addr = None
+                    store_commands[i][2][1] =  None
+            
+            # if an ending address was involved
+            if end_addr and start_line and line_num > start_line:
+                if regex_addr(end_addr):
+                    end_addr_reg = end_addr[1:-1] 
+                    if re.search(rf'{end_addr_reg}', line):
+                        store_commands[i][2][1] = line_num
+                        store_commands[i][1][1] = None
+                elif end_addr.isnumeric(): 
+                    if line_num == int(end_addr):
+                        store_commands[i][2][1] = line_num
+                        store_commands[i][1][1] = None
+                elif dollar_addr(start_addr):
+                    if next_line == '':
+                        store_commands[i][2][1] = line_num
+                        store_commands[i][1][1] = None
+                        
+            # if there is a match within the line
+            if (not end_addr and start_line == line_num) or \
+                (start_addr and end_addr and start_line and line_num >= start_line and not end_line):  
+                # quit command
+                if sed_quit(command):
+                    quit_flag = True
+                    break
+                    
+                # print command
+                elif sed_print(command) and not delete_flag:
+                    if line[-1] != '\n':
+                        print(line, file=output_stream)
+                    else:
+                        print(line, end="", file=output_stream)
+                        
+                # delete command
+                elif sed_delete(command):
+                    delete_flag = True
+                    
+                # search command
+                elif sed_search(command):
+                    # strings replace is just the sed search between the starting and ending delimiters
+                    if command[-1] == 'g':
+                        strings_replace = command[s_index + 2:-2]
+                    else:
+                        strings_replace = command[s_index + 2:-1]
+                    
+                    for c_index, char in enumerate(strings_replace):
+                        if char == delim:
+                            if c_index > 0 and strings_replace[c_index - 1] != '\\':
+                                break
+                    to_replace = strings_replace[:c_index]
+                    replace_with = strings_replace[c_index + 1:]
+                    
+                    if f'\\{delim}' in to_replace:
+                        # remove backslashes
+                        to_replace = re.sub(rf'\\({delim})', r'\1', to_replace)
+                    
+                    if f'\\{delim}' in replace_with:
+                        # remove backslashes
+                        replace_with = re.sub(rf'\\({delim})', r'\1', replace_with)
+                    
+                    # store the original line
+                    og_line = line
+                    
+                    # perform line substitutions
+                    if command[-1] == 'g':
+                        line = re.sub(rf'{to_replace}', rf'{replace_with}', line)
+                    else:
+                        line = re.sub(rf'{to_replace}', rf'{replace_with}', line, count=1)
+                    
+                    if og_line != line:
+                        successful_search = True
+                    
+                # append command
+                elif sed_append(command):
+                    append_string = ''.join(re.split(r'(a)', command)[2:]).lstrip()
+                    append_list.append(append_string)
+
+                # insert command
+                elif sed_insert(command):
+                    insert_string = ''.join(re.split(rf'(i)', command)[2:]).lstrip()
+                    insert_list.append(insert_string)
+                    
+                # change command
+                elif sed_change(command):
+                    line = ''.join(re.split(rf'(c)', command)[2:]).lstrip()
+                    change_flag = True
+                    
+                    # print the line only after we found the ending address
+                    if store_commands[i][2][1]:
+                        if line[-1] != '\n':
+                            print(line, file=output_stream)
+                        else:
+                            print(line, end="", file=output_stream)
+                    
+                # branch command
+                elif sed_branch(command):
+                    label = re.split(r'b ', command)[1].strip()
+                    store_commands[i][1][1] = None
+                    
+                    i = store_labels[label]
+                
+                # conditional branch command
+                elif sed_conditional_branch(command) and successful_search:
+                    label = re.split(r't ', command)[1].strip()
+                    store_commands[i][1][1] = None
+                    i = store_labels[label]
+                    successful_search = False
+                    
+            i += 1
+
+        if not delete_flag:
+            if insert_list:
+                for s in insert_list:
+                    print(s, file=output_stream)
+        
+            # don't print input lines if '-n' specified
+            if not dash_n_flag and not change_flag: 
+                if line[-1] != '\n':
+                    print(line, file=output_stream)
+                else:
+                    print(line, end="", file=output_stream)
+                
+            if append_list:
+                for s in append_list:
+                    print(s, file=output_stream)
+                
+            if quit_flag:
+                sys.exit(0)
+
+
+# if file input or sys.stdin options
+if list_input:
+    for file in list_input:
+        try:
+            infile = open(file, 'r+')
+        except:
+            print("slippy: error", file=sys.stderr)
+            sys.exit(1)
+            
+        if dash_i_flag:
+            # clear the temp file
+            open("temp", "w").close()
+            temp_file = open('temp', 'r+')
+            main_script(infile, output_stream=temp_file)
+            temp_file.close()   
+            infile.close()
+            # clear input file too
+            open(file, "w").close()
+            
+            # re open input file to replace it
+            infile = open(file, 'w')
+            temp_file = open('temp')
+            for line in temp_file:
+                infile.write(line)
+            temp_file.close()
+        else:
+            main_script(infile)
+        
+        infile.close()
+else:   
+    main_script(sys.stdin)
